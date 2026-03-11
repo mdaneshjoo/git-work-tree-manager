@@ -1,4 +1,4 @@
-# git-worktree-clone
+# git-worktree-manager
 
 Create fully functional git worktrees with all runtime dependencies copied over — so the new worktree is immediately ready to run.
 
@@ -54,8 +54,8 @@ cd git-worktree-manager
 ### Manual
 
 ```bash
-cp git-worktree-clone ~/bin/
-chmod +x ~/bin/git-worktree-clone
+cp git-worktree-manager ~/bin/
+chmod +x ~/bin/git-worktree-manager
 
 # Make sure ~/bin is in your PATH
 echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc
@@ -74,7 +74,7 @@ INSTALL_DIR=/usr/local/bin ./install.sh
 
 ```bash
 cd your-project
-git-worktree-clone <branch> [worktree-path]
+git-worktree-manager <branch> [worktree-path]
 ```
 
 The branch is created from current HEAD if it doesn't exist. The worktree path defaults to `../<project>-<branch>` (slashes in branch names are replaced with dashes).
@@ -83,27 +83,27 @@ The branch is created from current HEAD if it doesn't exist. The worktree path d
 
 ```bash
 # Create worktree for a new feature branch
-git-worktree-clone feature/new-dashboard
+git-worktree-manager feature/new-dashboard
 
 # Worktree is created at ../your-project-feature-new-dashboard/
 # with node_modules, .env, etc. all copied over
 
 # Specify a custom path
-git-worktree-clone hotfix/login ~/worktrees/login-fix
+git-worktree-manager hotfix/login ~/worktrees/login-fix
 
 # Use an existing branch
-git-worktree-clone develop
+git-worktree-manager develop
 ```
 
 ### List worktrees
 
 ```bash
 # List worktrees for the current repo
-git-worktree-clone -l
-git-worktree-clone --list
+git-worktree-manager -l
+git-worktree-manager --list
 
 # List worktrees across all repos
-git-worktree-clone --all -l
+git-worktree-manager --all -l
 ```
 
 Output:
@@ -121,14 +121,14 @@ Output:
 
 ```bash
 # Remove by ID (shown when created and in --list output)
-git-worktree-clone -r a3f7x2
-git-worktree-clone --remove a3f7x2
+git-worktree-manager -r a3f7x2
+git-worktree-manager --remove a3f7x2
 
 # Remove by branch name
-git-worktree-clone -r feature/new-dashboard
+git-worktree-manager -r feature/new-dashboard
 
 # Remove by path
-git-worktree-clone -r /Users/you/projects/my-project-feature-new-dashboard
+git-worktree-manager -r /Users/you/projects/my-project-feature-new-dashboard
 ```
 
 Removal will:
@@ -142,8 +142,8 @@ Removal will:
 Preview what would be copied without making any changes:
 
 ```bash
-git-worktree-clone -n feature/test
-git-worktree-clone --dry-run feature/test
+git-worktree-manager -n feature/test
+git-worktree-manager --dry-run feature/test
 ```
 
 ### Symlink mode
@@ -151,15 +151,15 @@ git-worktree-clone --dry-run feature/test
 Use symlinks instead of copies for large directories (`node_modules`, `vendor`, `Pods`). Saves disk space but changes in one worktree's dependencies affect the other:
 
 ```bash
-git-worktree-clone --symlink feature/experiment
+git-worktree-manager --symlink feature/experiment
 ```
 
 ## Commands Reference
 
 ```
-git-worktree-clone [options] <branch> [worktree-path]
-git-worktree-clone --remove <id|branch|path>
-git-worktree-clone --list [--all]
+git-worktree-manager [options] <branch> [worktree-path]
+git-worktree-manager --remove <id|branch|path>
+git-worktree-manager --list [--all]
 ```
 
 | Flag | Short | Description |
@@ -176,12 +176,12 @@ git-worktree-clone --list [--all]
 1. **Creates a git worktree** using `git worktree add` for the given branch
 2. **Detects the project type** by looking for marker files (`package.json`, `go.mod`, `Podfile`, etc.)
 3. **Copies runtime dependencies** that are typically gitignored but required to run the project
-4. **Registers the worktree** in a JSON registry at `~/.config/git-worktree-clone/registry.json` with a unique 6-character ID
+4. **Registers the worktree** in a JSON registry at `~/.config/git-worktree-manager/registry.json` with a unique 6-character ID
 5. For **Python projects**, it fixes the virtualenv paths (`pyvenv.cfg` and `activate` scripts) to point to the new worktree location
 
 ### Registry
 
-The registry is a simple JSON file stored at `~/.config/git-worktree-clone/registry.json`. It tracks:
+The registry is a simple JSON file stored at `~/.config/git-worktree-manager/registry.json`. It tracks:
 
 - **id** — unique 6-character alphanumeric identifier
 - **repo** — absolute path to the source repository
@@ -194,8 +194,8 @@ The registry is managed using `python3` for portable JSON handling.
 ## Uninstall
 
 ```bash
-rm ~/bin/git-worktree-clone
-rm -rf ~/.config/git-worktree-clone
+rm ~/bin/git-worktree-manager
+rm -rf ~/.config/git-worktree-manager
 ```
 
 Remove the `export PATH="$HOME/bin:$PATH"` line from your shell config if you no longer need it.

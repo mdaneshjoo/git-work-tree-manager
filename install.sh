@@ -14,11 +14,11 @@ info() { echo -e "${CYAN}[i]${NC} $1"; }
 err()  { echo -e "${RED}[✗]${NC} $1" >&2; }
 
 INSTALL_DIR="${INSTALL_DIR:-$HOME/bin}"
-SCRIPT_NAME="git-worktree-clone"
-REPO_URL="https://raw.githubusercontent.com/mdaneshjoo/git-work-tree-manager/master/git-worktree-clone"
+SCRIPT_NAME="git-worktree-manager"
+REPO_URL="https://raw.githubusercontent.com/mdaneshjoo/git-work-tree-manager/master/git-worktree-manager"
 
 echo ""
-echo -e "${BOLD}git-worktree-clone installer${NC}"
+echo -e "${BOLD}git-worktree-manager installer${NC}"
 echo ""
 
 # Detect shell
@@ -107,17 +107,17 @@ else
 fi
 
 # Create config directory
-mkdir -p "$HOME/.config/git-worktree-clone"
+mkdir -p "$HOME/.config/git-worktree-manager"
 log "Config directory ready"
 
 # Done
 echo ""
 echo -e "${GREEN}${BOLD}Installation complete!${NC}"
 echo ""
-echo -e "  Usage:  ${CYAN}git-worktree-clone <branch>${NC}"
-echo -e "  List:   ${CYAN}git-worktree-clone -l${NC}"
-echo -e "  Remove: ${CYAN}git-worktree-clone -r <id>${NC}"
-echo -e "  Help:   ${CYAN}git-worktree-clone -h${NC}"
+echo -e "  Usage:  ${CYAN}git-worktree-manager <branch>${NC}"
+echo -e "  List:   ${CYAN}git-worktree-manager -l${NC}"
+echo -e "  Remove: ${CYAN}git-worktree-manager -r <id>${NC}"
+echo -e "  Help:   ${CYAN}git-worktree-manager -h${NC}"
 echo ""
 
 if [[ "$PATH_UPDATED" == "true" ]]; then
