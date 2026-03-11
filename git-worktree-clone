@@ -1,0 +1,496 @@
+#!/usr/bin/env bash
+set -eo pipefail
+
+# git-worktree-clone: Create a git worktree with all runtime dependencies copied over
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+log()  { echo -e "${GREEN}[✓]${NC} $1"; }
+warn() { echo -e "${YELLOW}[!]${NC} $1"; }
+info() { echo -e "${CYAN}[i]${NC} $1"; }
+err()  { echo -e "${RED}[✗]${NC} $1" >&2; }
+
+# --- Registry: stores worktree ID -> metadata ---
+REGISTRY_DIR="$HOME/.config/git-worktree-clone"
+REGISTRY_FILE="$REGISTRY_DIR/registry.json"
+
+init_registry() {
+    mkdir -p "$REGISTRY_DIR"
+    [[ -f "$REGISTRY_FILE" ]] || echo '[]' > "$REGISTRY_FILE"
+}
+
+generate_id() {
+    # 6-char alphanumeric ID
+    LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom 2>/dev/null | head -c 6 || true
+}
+
+registry_add() {
+    local id="$1" repo="$2" branch="$3" path="$4" created_at="$5"
+    init_registry
+
+    # Use python for portable JSON manipulation (available on macOS)
+    python3 -c "
+import json, sys
+with open('$REGISTRY_FILE', 'r') as f:
+    data = json.load(f)
+data.append({
+    'id': '$id',
+    'repo': '$repo',
+    'branch': '$branch',
+    'path': '$path',
+    'created_at': '$created_at'
+})
+with open('$REGISTRY_FILE', 'w') as f:
+    json.dump(data, f, indent=2)
+"
+}
+
+registry_remove() {
+    local id="$1"
+    init_registry
+    python3 -c "
+import json
+with open('$REGISTRY_FILE', 'r') as f:
+    data = json.load(f)
+data = [e for e in data if e['id'] != '$id']
+with open('$REGISTRY_FILE', 'w') as f:
+    json.dump(data, f, indent=2)
+"
+}
+
+registry_find() {
+    # Find entry by ID, branch, or path. Outputs: id|repo|branch|path
+    local target="$1"
+    init_registry
+    python3 -c "
+import json, sys
+with open('$REGISTRY_FILE', 'r') as f:
+    data = json.load(f)
+for e in data:
+    if e['id'] == '$target' or e['branch'] == '$target' or e['path'] == '$target':
+        print(e['id'] + '|' + e['repo'] + '|' + e['branch'] + '|' + e['path'])
+        sys.exit(0)
+sys.exit(1)
+" 2>/dev/null
+}
+
+registry_list() {
+    local repo_filter="${1:-}"
+    init_registry
+    python3 -c "
+import json
+with open('$REGISTRY_FILE', 'r') as f:
+    data = json.load(f)
+repo_filter = '$repo_filter'
+entries = [e for e in data if not repo_filter or e['repo'] == repo_filter]
+if not entries:
+    print('  No worktrees registered.')
+else:
+    # Header
+    print(f'  {\"ID\":<8} {\"Branch\":<25} {\"Created\":<20} Path')
+    print(f'  {\"──\":<8} {\"──────\":<25} {\"───────\":<20} ────')
+    for e in entries:
+        print(f'  {e[\"id\"]:<8} {e[\"branch\"]:<25} {e.get(\"created_at\",\"?\"):<20} {e[\"path\"]}')
+"
+}
+
+# --- Usage ---
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [options] <branch> [worktree-path]
+       $(basename "$0") --remove <id|branch|path>
+       $(basename "$0") --list
+
+Create a git worktree and copy runtime dependencies so the project is immediately runnable.
+Each worktree gets a unique ID for easy management.
+
+Arguments:
+  branch          Branch name for the worktree (created if it doesn't exist)
+  worktree-path   Optional path for the worktree (default: ../\$(basename \$PWD)-<branch>)
+
+Supported project types (auto-detected):
+  - Node.js / React (node_modules, .env, .env.local, etc.)
+  - Python          (venv, .venv, .env, __pycache__)
+  - Go              (vendor, .env)
+  - iOS / Xcode     (Pods, .env, DerivedData)
+
+Options:
+  -h, --help      Show this help message
+  -n, --dry-run   Show what would be copied without doing it
+  --symlink       Use symlinks instead of copies for large dirs (node_modules, vendor, Pods)
+  --remove, -r    Remove a worktree by ID, branch name, or path (also deletes the branch)
+  --list, -l      List all registered worktrees (current repo only, or --all for all repos)
+  --all           Used with --list to show worktrees from all repos
+EOF
+    exit 0
+}
+
+DRY_RUN=false
+USE_SYMLINK=false
+LIST_ALL=false
+
+# --- Remove worktree ---
+remove_worktree() {
+    local target="$1"
+
+    SOURCE_DIR="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+        err "Not inside a git repository"
+        exit 1
+    }
+
+    # Look up in registry first
+    local entry
+    if entry=$(registry_find "$target"); then
+        IFS='|' read -r wt_id wt_repo wt_branch wt_path <<< "$entry"
+    else
+        err "Worktree not found for: $target"
+        info "Use --list to see registered worktrees"
+        exit 1
+    fi
+
+    echo ""
+    info "ID:       ${BOLD}$wt_id${NC}"
+    info "Branch:   $wt_branch"
+    info "Path:     $wt_path"
+    info "Repo:     $wt_repo"
+    echo ""
+
+    # Confirm removal
+    echo -en "${YELLOW}[?]${NC} Remove this worktree and delete branch '${wt_branch}'? [y/N] "
+    read -r confirm
+    if [[ "$confirm" != [yY] && "$confirm" != [yY][eE][sS] ]]; then
+        warn "Aborted."
+        exit 0
+    fi
+
+    # Remove the worktree
+    if [[ -d "$wt_path" ]]; then
+        git worktree remove "$wt_path" --force 2>/dev/null || {
+            warn "git worktree remove failed, cleaning up manually..."
+            rm -rf "$wt_path"
+            git worktree prune
+        }
+        log "Worktree removed: $wt_path"
+    else
+        warn "Worktree directory already gone: $wt_path"
+        git worktree prune 2>/dev/null || true
+    fi
+
+    # Delete the branch
+    if [[ -n "$wt_branch" ]]; then
+        if git rev-parse --verify "$wt_branch" >/dev/null 2>&1; then
+            git branch -D "$wt_branch" 2>/dev/null && log "Branch deleted: $wt_branch" || warn "Could not delete branch: $wt_branch"
+        fi
+    fi
+
+    # Remove from registry
+    registry_remove "$wt_id"
+    log "Removed from registry: $wt_id"
+
+    echo ""
+    log "Cleanup complete."
+    exit 0
+}
+
+# --- List worktrees ---
+list_worktrees() {
+    echo ""
+
+    if $LIST_ALL; then
+        info "All registered worktrees:"
+        echo ""
+        registry_list ""
+    else
+        SOURCE_DIR="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+            err "Not inside a git repository"
+            exit 1
+        }
+        info "Worktrees for ${BOLD}$(basename "$SOURCE_DIR")${NC}:"
+        echo ""
+        registry_list "$SOURCE_DIR"
+    fi
+
+    echo ""
+    exit 0
+}
+
+# --- Parse args ---
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)        usage ;;
+        -n|--dry-run)     DRY_RUN=true; shift ;;
+        --symlink)        USE_SYMLINK=true; shift ;;
+        --all)            LIST_ALL=true; shift ;;
+        --remove|-r)      shift; [[ $# -lt 1 ]] && { err "Missing argument for --remove"; exit 1; }; remove_worktree "$1" ;;
+        --list|-l)        list_worktrees ;;
+        -*)               err "Unknown option: $1"; usage ;;
+        *)                break ;;
+    esac
+done
+
+# --list with --all (handle if --all comes before --list)
+if $LIST_ALL; then
+    list_worktrees
+fi
+
+if [[ $# -lt 1 ]]; then
+    err "Missing required argument: branch"
+    usage
+fi
+
+BRANCH="$1"
+if ! SOURCE_DIR="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    err "Not inside a git repository. cd into your project first."
+    exit 1
+fi
+
+PROJECT_NAME="$(basename "$SOURCE_DIR")"
+# Replace / in branch names with - for the directory name
+BRANCH_SAFE="${BRANCH//\//-}"
+WORKTREE_PATH="${2:-$(dirname "$SOURCE_DIR")/${PROJECT_NAME}-${BRANCH_SAFE}}"
+
+# --- Detect project types (a project can be multiple types) ---
+declare -a PROJECT_TYPES=()
+
+detect_projects() {
+    [[ -f "$SOURCE_DIR/package.json" ]]      && PROJECT_TYPES+=("nodejs")
+    [[ -f "$SOURCE_DIR/go.mod" ]]            && PROJECT_TYPES+=("golang")
+    [[ -f "$SOURCE_DIR/Podfile" ]]           && PROJECT_TYPES+=("ios")
+    [[ -f "$SOURCE_DIR/requirements.txt" || -f "$SOURCE_DIR/pyproject.toml" || -f "$SOURCE_DIR/Pipfile" || -f "$SOURCE_DIR/setup.py" ]] && PROJECT_TYPES+=("python")
+
+    # Check for monorepo with multiple package.json (React/Next.js)
+    if [[ -f "$SOURCE_DIR/package.json" ]]; then
+        if grep -qE '"react"|"next"|"vue"|"angular"' "$SOURCE_DIR/package.json" 2>/dev/null; then
+            PROJECT_TYPES+=("react")
+        fi
+    fi
+
+    if [[ ${#PROJECT_TYPES[@]} -eq 0 ]]; then
+        warn "No known project type detected. Will only create the worktree."
+    fi
+}
+
+# --- Copy or symlink a path ---
+copy_item() {
+    local src="$1"
+    local dst="$2"
+    local name="$3"
+    local use_link="${4:-false}"
+
+    if [[ ! -e "$src" ]]; then
+        return
+    fi
+
+    if $DRY_RUN; then
+        if [[ "$use_link" == "true" ]]; then
+            info "[dry-run] Would symlink: $name"
+        else
+            info "[dry-run] Would copy: $name"
+        fi
+        return
+    fi
+
+    mkdir -p "$(dirname "$dst")"
+
+    if [[ "$use_link" == "true" ]]; then
+        ln -sf "$src" "$dst"
+        log "Symlinked: $name"
+    else
+        if [[ -d "$src" ]]; then
+            cp -a "$src" "$dst"
+            log "Copied dir: $name"
+        else
+            cp -a "$src" "$dst"
+            log "Copied file: $name"
+        fi
+    fi
+}
+
+# --- Copy env files (common to all project types) ---
+copy_env_files() {
+    local src_dir="$1"
+    local dst_dir="$2"
+
+    for envfile in .env .env.local .env.development .env.development.local \
+                   .env.test .env.test.local .env.production .env.production.local \
+                   .env.staging; do
+        copy_item "$src_dir/$envfile" "$dst_dir/$envfile" "$envfile"
+    done
+}
+
+# --- Node.js / React ---
+setup_nodejs() {
+    info "Setting up Node.js dependencies..."
+    local link=$USE_SYMLINK
+
+    copy_item "$SOURCE_DIR/node_modules" "$WORKTREE_PATH/node_modules" "node_modules" "$link"
+
+    # Handle monorepo workspaces (e.g., packages/*/node_modules)
+    if [[ -f "$SOURCE_DIR/package.json" ]]; then
+        local workspaces
+        workspaces=$(node -e "
+            const pkg = require('$SOURCE_DIR/package.json');
+            const ws = pkg.workspaces || (pkg.workspaces && pkg.workspaces.packages) || [];
+            const flat = Array.isArray(ws) ? ws : ws.packages || [];
+            flat.forEach(w => console.log(w));
+        " 2>/dev/null || true)
+
+        if [[ -n "$workspaces" ]]; then
+            while IFS= read -r pattern; do
+                for ws_dir in $SOURCE_DIR/$pattern; do
+                    [[ -d "$ws_dir/node_modules" ]] || continue
+                    local rel="${ws_dir#$SOURCE_DIR/}"
+                    copy_item "$ws_dir/node_modules" "$WORKTREE_PATH/$rel/node_modules" "$rel/node_modules" "$link"
+                done
+            done <<< "$workspaces"
+        fi
+    fi
+
+    # .next / dist / build caches
+    for cache_dir in .next .nuxt dist build .turbo; do
+        [[ -d "$SOURCE_DIR/$cache_dir" ]] && copy_item "$SOURCE_DIR/$cache_dir" "$WORKTREE_PATH/$cache_dir" "$cache_dir" "$link"
+    done
+
+    copy_env_files "$SOURCE_DIR" "$WORKTREE_PATH"
+}
+
+# --- Python ---
+setup_python() {
+    info "Setting up Python dependencies..."
+
+    for venv_dir in venv .venv env .env_venv; do
+        if [[ -d "$SOURCE_DIR/$venv_dir" && -f "$SOURCE_DIR/$venv_dir/bin/activate" ]]; then
+            copy_item "$SOURCE_DIR/$venv_dir" "$WORKTREE_PATH/$venv_dir" "$venv_dir (virtualenv)" "$USE_SYMLINK"
+
+            if ! $DRY_RUN && ! $USE_SYMLINK && [[ -d "$WORKTREE_PATH/$venv_dir" ]]; then
+                if [[ -f "$WORKTREE_PATH/$venv_dir/pyvenv.cfg" ]]; then
+                    sed -i '' "s|$SOURCE_DIR|$WORKTREE_PATH|g" "$WORKTREE_PATH/$venv_dir/pyvenv.cfg" 2>/dev/null || true
+                fi
+                for activate in "$WORKTREE_PATH/$venv_dir/bin/activate"*; do
+                    [[ -f "$activate" ]] && sed -i '' "s|$SOURCE_DIR/$venv_dir|$WORKTREE_PATH/$venv_dir|g" "$activate" 2>/dev/null || true
+                done
+                log "Fixed virtualenv paths for new location"
+            fi
+        fi
+    done
+
+    copy_item "$SOURCE_DIR/.python-version" "$WORKTREE_PATH/.python-version" ".python-version"
+    copy_env_files "$SOURCE_DIR" "$WORKTREE_PATH"
+}
+
+# --- Go ---
+setup_golang() {
+    info "Setting up Go dependencies..."
+
+    if [[ -d "$SOURCE_DIR/vendor" ]]; then
+        copy_item "$SOURCE_DIR/vendor" "$WORKTREE_PATH/vendor" "vendor" "$USE_SYMLINK"
+    fi
+
+    copy_env_files "$SOURCE_DIR" "$WORKTREE_PATH"
+    copy_item "$SOURCE_DIR/.air.toml" "$WORKTREE_PATH/.air.toml" ".air.toml"
+    [[ -d "$SOURCE_DIR/tmp" ]] && copy_item "$SOURCE_DIR/tmp" "$WORKTREE_PATH/tmp" "tmp (build cache)"
+}
+
+# --- iOS / Xcode ---
+setup_ios() {
+    info "Setting up iOS dependencies..."
+
+    if [[ -d "$SOURCE_DIR/Pods" ]]; then
+        copy_item "$SOURCE_DIR/Pods" "$WORKTREE_PATH/Pods" "Pods" "$USE_SYMLINK"
+    fi
+
+    for spm_dir in .build .swiftpm; do
+        [[ -d "$SOURCE_DIR/$spm_dir" ]] && copy_item "$SOURCE_DIR/$spm_dir" "$WORKTREE_PATH/$spm_dir" "$spm_dir" "$USE_SYMLINK"
+    done
+
+    [[ -d "$SOURCE_DIR/Carthage" ]] && copy_item "$SOURCE_DIR/Carthage" "$WORKTREE_PATH/Carthage" "Carthage" "$USE_SYMLINK"
+
+    for xcdir in "$SOURCE_DIR"/*.xcworkspace; do
+        [[ -d "$xcdir" ]] || continue
+        local name="$(basename "$xcdir")"
+        copy_item "$xcdir" "$WORKTREE_PATH/$name" "$name"
+    done
+
+    copy_env_files "$SOURCE_DIR" "$WORKTREE_PATH"
+
+    for cfg in GoogleService-Info.plist firebase.json .xcconfig; do
+        find "$SOURCE_DIR" -maxdepth 3 -name "$cfg" -not -path "*/Pods/*" 2>/dev/null | while read -r f; do
+            local rel="${f#$SOURCE_DIR/}"
+            copy_item "$f" "$WORKTREE_PATH/$rel" "$rel"
+        done
+    done
+}
+
+# --- Main ---
+main() {
+    local WT_ID
+    WT_ID=$(generate_id)
+    local CREATED_AT
+    CREATED_AT=$(date '+%Y-%m-%d %H:%M')
+
+    echo ""
+    info "ID:       ${BOLD}$WT_ID${NC}"
+    info "Source:   $SOURCE_DIR"
+    info "Branch:   $BRANCH"
+    info "Worktree: $WORKTREE_PATH"
+    echo ""
+
+    detect_projects
+    info "Detected project types: ${PROJECT_TYPES[*]:-none}"
+    echo ""
+
+    # Create the worktree
+    if $DRY_RUN; then
+        info "[dry-run] Would create worktree at $WORKTREE_PATH for branch $BRANCH"
+    else
+        if git rev-parse --verify "$BRANCH" >/dev/null 2>&1; then
+            git worktree add "$WORKTREE_PATH" "$BRANCH"
+        else
+            info "Branch '$BRANCH' does not exist, creating from current HEAD..."
+            git worktree add -b "$BRANCH" "$WORKTREE_PATH"
+        fi
+        log "Worktree created at $WORKTREE_PATH"
+
+        # Register in registry
+        registry_add "$WT_ID" "$SOURCE_DIR" "$BRANCH" "$WORKTREE_PATH" "$CREATED_AT"
+        log "Registered with ID: ${BOLD}$WT_ID${NC}"
+    fi
+
+    echo ""
+
+    # Copy dependencies per project type
+    for ptype in "${PROJECT_TYPES[@]}"; do
+        case "$ptype" in
+            nodejs|react) setup_nodejs ;;
+            python)       setup_python ;;
+            golang)       setup_golang ;;
+            ios)          setup_ios ;;
+        esac
+    done
+
+    # Always copy common config files
+    info "Copying common config files..."
+    for common in .editorconfig .tool-versions .nvmrc .node-version \
+                  .ruby-version .mise.toml .mise.local.toml \
+                  docker-compose.override.yml .docker-env; do
+        copy_item "$SOURCE_DIR/$common" "$WORKTREE_PATH/$common" "$common"
+    done
+
+    echo ""
+    if $DRY_RUN; then
+        warn "Dry run complete. No changes were made."
+    else
+        log "Done! Your worktree is ready at:"
+        echo -e "   ${CYAN}cd $WORKTREE_PATH${NC}"
+        echo ""
+        echo -e "   To remove later: ${DIM}git-worktree-clone -r $WT_ID${NC}"
+    fi
+}
+
+main
