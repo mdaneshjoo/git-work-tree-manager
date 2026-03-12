@@ -358,6 +358,27 @@ setup_nodejs() {
     done
 
     copy_env_files "$SOURCE_DIR" "$WORKTREE_PATH"
+
+    # Fix Husky git hooks for worktree
+    if [[ -d "$SOURCE_DIR/.husky" ]] && ! $DRY_RUN; then
+        info "Fixing Husky git hooks for worktree..."
+        # Get the actual git common dir (the main repo's .git directory)
+        local git_common_dir
+        git_common_dir="$(cd "$WORKTREE_PATH" && git rev-parse --git-common-dir)"
+        # Get worktree-specific git dir
+        local git_dir
+        git_dir="$(cd "$WORKTREE_PATH" && git rev-parse --git-dir)"
+
+        # Set core.hooksPath so Husky hooks resolve from the worktree
+        (cd "$WORKTREE_PATH" && git config core.hooksPath "$WORKTREE_PATH/.husky")
+
+        # If husky has an install script in package.json, run it
+        if command -v npx &>/dev/null && [[ -f "$WORKTREE_PATH/.husky/_/husky.sh" || -f "$WORKTREE_PATH/.husky/husky.sh" ]]; then
+            log "Husky hooks path configured for worktree"
+        elif command -v npx &>/dev/null; then
+            (cd "$WORKTREE_PATH" && npx husky 2>/dev/null) && log "Husky re-initialized in worktree" || warn "Could not re-initialize Husky (non-critical)"
+        fi
+    fi
 }
 
 # --- Python ---
