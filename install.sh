@@ -15,7 +15,11 @@ err()  { echo -e "${RED}[✗]${NC} $1" >&2; }
 
 INSTALL_DIR="${INSTALL_DIR:-$HOME/bin}"
 SCRIPT_NAME="git-worktree-manager"
-REPO_URL="https://raw.githubusercontent.com/mdaneshjoo/git-work-tree-manager/master/git-worktree-manager"
+GITHUB_OWNER="mdaneshjoo"
+GITHUB_REPO="git-work-tree-manager"
+GITHUB_API="https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}"
+CONFIG_DIR="$HOME/.config/git-worktree-manager"
+VERSION_FILE="$CONFIG_DIR/version"
 
 echo ""
 echo -e "${BOLD}git-worktree-manager installer${NC}"
@@ -63,24 +67,41 @@ if [[ ! -d "$INSTALL_DIR" ]]; then
     log "Created $INSTALL_DIR"
 fi
 
-# Install the script
-# If running from a cloned repo, copy locally; otherwise download
-SCRIPT_SOURCE=""
+# Resolve the version to install
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INSTALL_VERSION=""
 
 if [[ -f "$SCRIPT_DIR/$SCRIPT_NAME" ]]; then
-    SCRIPT_SOURCE="$SCRIPT_DIR/$SCRIPT_NAME"
+    # Installing from a cloned repo — detect version from git tag
     info "Installing from local source..."
-    cp "$SCRIPT_SOURCE" "$INSTALL_DIR/$SCRIPT_NAME"
+    cp "$SCRIPT_DIR/$SCRIPT_NAME" "$INSTALL_DIR/$SCRIPT_NAME"
+    INSTALL_VERSION=$(cd "$SCRIPT_DIR" && git describe --tags --abbrev=0 2>/dev/null || echo "")
 else
-    info "Downloading $SCRIPT_NAME..."
+    # Fetch latest release tag from GitHub
+    info "Fetching latest release from GitHub..."
+    LATEST_RELEASE=$(
+        if command -v curl &>/dev/null; then
+            curl -fsSL "${GITHUB_API}/releases/latest" 2>/dev/null
+        elif command -v wget &>/dev/null; then
+            wget -qO- "${GITHUB_API}/releases/latest" 2>/dev/null
+        else
+            err "curl or wget is required to download the script."
+            exit 1
+        fi
+    )
+    INSTALL_VERSION=$(python3 -c "import json,sys; print(json.loads(sys.stdin.read()).get('tag_name',''))" <<< "$LATEST_RELEASE")
+
+    if [[ -z "$INSTALL_VERSION" ]]; then
+        warn "No releases found, falling back to master branch..."
+        INSTALL_VERSION="master"
+    fi
+
+    DOWNLOAD_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${INSTALL_VERSION}/${SCRIPT_NAME}"
+    info "Downloading ${SCRIPT_NAME} (${INSTALL_VERSION})..."
     if command -v curl &>/dev/null; then
-        curl -fsSL "$REPO_URL" -o "$INSTALL_DIR/$SCRIPT_NAME"
+        curl -fsSL "$DOWNLOAD_URL" -o "$INSTALL_DIR/$SCRIPT_NAME"
     elif command -v wget &>/dev/null; then
-        wget -qO "$INSTALL_DIR/$SCRIPT_NAME" "$REPO_URL"
-    else
-        err "curl or wget is required to download the script."
-        exit 1
+        wget -qO "$INSTALL_DIR/$SCRIPT_NAME" "$DOWNLOAD_URL"
     fi
 fi
 
@@ -106,9 +127,12 @@ else
     PATH_UPDATED=false
 fi
 
-# Create config directory
-mkdir -p "$HOME/.config/git-worktree-manager"
-log "Config directory ready"
+# Create config directory and save installed version
+mkdir -p "$CONFIG_DIR"
+if [[ -n "$INSTALL_VERSION" ]]; then
+    echo "$INSTALL_VERSION" > "$VERSION_FILE"
+    log "Installed version: $INSTALL_VERSION"
+fi
 
 # Done
 echo ""

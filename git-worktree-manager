@@ -19,6 +19,10 @@ err()  { echo -e "${RED}[✗]${NC} $1" >&2; }
 # --- Registry: stores worktree ID -> metadata ---
 REGISTRY_DIR="$HOME/.config/git-worktree-manager"
 REGISTRY_FILE="$REGISTRY_DIR/registry.json"
+GITHUB_OWNER="mdaneshjoo"
+GITHUB_REPO="git-work-tree-manager"
+GITHUB_API="https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}"
+VERSION_FILE="$REGISTRY_DIR/version"
 
 init_registry() {
     mkdir -p "$REGISTRY_DIR"
@@ -100,12 +104,110 @@ else:
 "
 }
 
+# --- GitHub helpers ---
+github_get() {
+    local url="$1"
+    if command -v curl &>/dev/null; then
+        curl -fsSL "$url" 2>/dev/null
+    elif command -v wget &>/dev/null; then
+        wget -qO- "$url" 2>/dev/null
+    else
+        err "curl or wget is required."
+        exit 1
+    fi
+}
+
+get_local_version() {
+    if [[ -f "$VERSION_FILE" ]]; then
+        cat "$VERSION_FILE"
+    else
+        echo "unknown"
+    fi
+}
+
+get_latest_release() {
+    local response
+    response=$(github_get "${GITHUB_API}/releases/latest")
+    if [[ -z "$response" ]]; then
+        return 1
+    fi
+    python3 -c "
+import json, sys
+data = json.loads(sys.stdin.read())
+print(data.get('tag_name', ''))
+" <<< "$response"
+}
+
+# --- Self-update ---
+self_update() {
+    info "Checking for updates..."
+
+    local local_version latest_version
+    local_version=$(get_local_version)
+    latest_version=$(get_latest_release) || {
+        err "Failed to fetch latest release from GitHub."
+        exit 1
+    }
+
+    if [[ -z "$latest_version" ]]; then
+        err "No releases found on GitHub. Create a release/tag first."
+        exit 1
+    fi
+
+    if [[ "$latest_version" == "$local_version" ]]; then
+        log "Already up to date (${local_version})."
+        exit 0
+    fi
+
+    info "Current version: ${BOLD}${local_version}${NC}"
+    info "Latest version:  ${BOLD}${latest_version}${NC}"
+
+    # Download the script from the release tag
+    local download_url="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${latest_version}/git-worktree-manager"
+    local tmp_file
+    tmp_file=$(mktemp)
+    trap 'rm -f "$tmp_file"' RETURN
+
+    github_get "$download_url" > "$tmp_file"
+
+    if [[ ! -s "$tmp_file" ]]; then
+        err "Failed to download version ${latest_version}."
+        exit 1
+    fi
+
+    # Find where the script is installed
+    local script_path
+    script_path="$(command -v git-worktree-manager 2>/dev/null || echo "")"
+    if [[ -z "$script_path" ]]; then
+        script_path="${BASH_SOURCE[0]}"
+    fi
+    # Resolve symlinks
+    if [[ -L "$script_path" ]]; then
+        script_path="$(readlink -f "$script_path" 2>/dev/null || readlink "$script_path")"
+    fi
+
+    if [[ ! -w "$script_path" ]]; then
+        err "Cannot write to $script_path. Try: sudo git-worktree-manager --update"
+        exit 1
+    fi
+
+    # Replace the script and save installed version
+    cp "$tmp_file" "$script_path"
+    chmod +x "$script_path"
+    mkdir -p "$REGISTRY_DIR"
+    echo "$latest_version" > "$VERSION_FILE"
+
+    log "Updated to ${latest_version} at $script_path"
+    exit 0
+}
+
 # --- Usage ---
 usage() {
     cat <<EOF
 Usage: $(basename "$0") [options] <branch> [worktree-path]
        $(basename "$0") --remove <id|branch|path>
        $(basename "$0") --list
+       $(basename "$0") --update
 
 Create a git worktree and copy runtime dependencies so the project is immediately runnable.
 Each worktree gets a unique ID for easy management.
@@ -127,6 +229,8 @@ Options:
   --remove, -r    Remove a worktree by ID, branch name, or path (also deletes the branch)
   --list, -l      List all registered worktrees (current repo only, or --all for all repos)
   --all           Used with --list to show worktrees from all repos
+  --update        Update to the latest version from GitHub
+  --version, -v   Show the current version
 EOF
     exit 0
 }
@@ -227,6 +331,8 @@ while [[ $# -gt 0 ]]; do
         -n|--dry-run)     DRY_RUN=true; shift ;;
         --symlink)        USE_SYMLINK=true; shift ;;
         --all)            LIST_ALL=true; shift ;;
+        --update)         self_update ;;
+        --version|-v)     echo "git-worktree-manager $(get_local_version)"; exit 0 ;;
         --remove|-r)      shift; [[ $# -lt 1 ]] && { err "Missing argument for --remove"; exit 1; }; remove_worktree "$1" ;;
         --list|-l)        list_worktrees ;;
         -*)               err "Unknown option: $1"; usage ;;
