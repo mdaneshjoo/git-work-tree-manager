@@ -225,6 +225,7 @@ Supported project types (auto-detected):
 Options:
   -h, --help      Show this help message
   -n, --dry-run   Show what would be copied without doing it
+  --base, -b      Base branch to create the new branch from (default: current HEAD)
   --symlink       Use symlinks instead of copies for large dirs (node_modules, vendor, Pods)
   --remove, -r    Remove a worktree by ID, branch name, or path (also deletes the branch)
   --list, -l      List all registered worktrees (current repo only, or --all for all repos)
@@ -238,6 +239,7 @@ EOF
 DRY_RUN=false
 USE_SYMLINK=false
 LIST_ALL=false
+BASE_BRANCH=""
 
 # --- Remove worktree ---
 remove_worktree() {
@@ -333,6 +335,7 @@ while [[ $# -gt 0 ]]; do
         --all)            LIST_ALL=true; shift ;;
         --update)         self_update ;;
         --version|-v)     echo "git-worktree-manager $(get_local_version)"; exit 0 ;;
+        --base|-b)        shift; [[ $# -lt 1 ]] && { err "Missing argument for --base"; exit 1; }; BASE_BRANCH="$1"; shift ;;
         --remove|-r)      shift; [[ $# -lt 1 ]] && { err "Missing argument for --remove"; exit 1; }; remove_worktree "$1" ;;
         --list|-l)        list_worktrees ;;
         -*)               err "Unknown option: $1"; usage ;;
@@ -577,10 +580,22 @@ main() {
         info "[dry-run] Would create worktree at $WORKTREE_PATH for branch $BRANCH"
     else
         if git rev-parse --verify "$BRANCH" >/dev/null 2>&1; then
+            if [[ -n "$BASE_BRANCH" ]]; then
+                warn "Branch '$BRANCH' already exists, ignoring --base option."
+            fi
             git worktree add "$WORKTREE_PATH" "$BRANCH"
         else
-            info "Branch '$BRANCH' does not exist, creating from current HEAD..."
-            git worktree add -b "$BRANCH" "$WORKTREE_PATH"
+            if [[ -n "$BASE_BRANCH" ]]; then
+                if ! git rev-parse --verify "$BASE_BRANCH" >/dev/null 2>&1; then
+                    err "Base branch '$BASE_BRANCH' does not exist."
+                    exit 1
+                fi
+                info "Branch '$BRANCH' does not exist, creating from '$BASE_BRANCH'..."
+                git worktree add -b "$BRANCH" "$WORKTREE_PATH" "$BASE_BRANCH"
+            else
+                info "Branch '$BRANCH' does not exist, creating from current HEAD..."
+                git worktree add -b "$BRANCH" "$WORKTREE_PATH"
+            fi
         fi
         log "Worktree created at $WORKTREE_PATH"
 
