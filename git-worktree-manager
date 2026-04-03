@@ -220,7 +220,7 @@ Supported project types (auto-detected):
   - Node.js / React (node_modules, .env, .env.local, etc.)
   - Python          (venv, .venv, .env, __pycache__)
   - Go              (vendor, .env)
-  - iOS / Xcode     (Pods, .env, DerivedData)
+  - iOS / Xcode     (Pods, .swiftpm, Carthage, .xcworkspace, .env)
 
 Options:
   -h, --help      Show this help message
