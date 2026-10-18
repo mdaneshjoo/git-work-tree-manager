@@ -48,7 +48,7 @@ die() {
     local code="$1" msg="$2"
     err "$msg"
     if $JSON; then
-        python3 -c 'import json, sys; print(json.dumps({"error": sys.argv[1], "exit_code": int(sys.argv[2])}))' "$msg" "$code"
+        python3 -I -c 'import json, sys; print(json.dumps({"error": sys.argv[1], "exit_code": int(sys.argv[2])}))' "$msg" "$code"
     fi
     exit "$code"
 }
@@ -70,7 +70,7 @@ VERSION_FILE="$REGISTRY_DIR/version"
 #   registry list <repo|""> <table|json>
 registry() {
     mkdir -p "$REGISTRY_DIR"
-    python3 - "$REGISTRY_FILE" "$@" <<'PY'
+    python3 -I - "$REGISTRY_FILE" "$@" <<'PY'
 import fcntl, json, os, random, string, sys, tempfile
 
 path, op, args = sys.argv[1], sys.argv[2], sys.argv[3:]
@@ -162,7 +162,7 @@ get_latest_release() {
     if [[ -z "$response" ]]; then
         return 1
     fi
-    python3 -c "
+    python3 -I -c "
 import json, sys
 data = json.loads(sys.stdin.read())
 print(data.get('tag_name', ''))
@@ -336,7 +336,7 @@ remove_worktree() {
     log "Removed from registry: $wt_id"
 
     if $JSON; then
-        python3 -c 'import json, sys; a = sys.argv; print(json.dumps({"id": a[1], "repo": a[2], "branch": a[3], "path": a[4], "removed": True, "branch_deleted": a[5] == "true"}, indent=2))' \
+        python3 -I -c 'import json, sys; a = sys.argv; print(json.dumps({"id": a[1], "repo": a[2], "branch": a[3], "path": a[4], "removed": True, "branch_deleted": a[5] == "true"}, indent=2))' \
             "$wt_id" "$wt_repo" "$wt_branch" "$wt_path" "$branch_deleted"
     else
         blank
@@ -551,7 +551,7 @@ print_result() {
     local created="$1"
 
     if $JSON; then
-        python3 - "$WT_ID" "$SOURCE_DIR" "$BRANCH" "$WORKTREE_PATH" "$created" "$DRY_RUN" \
+        python3 -I - "$WT_ID" "$SOURCE_DIR" "$BRANCH" "$WORKTREE_PATH" "$created" "$DRY_RUN" \
             "${#COPIED[@]}" ${COPIED[@]+"${COPIED[@]}"} ${SKIPPED[@]+"${SKIPPED[@]}"} <<'PY'
 import json, sys
 a = sys.argv[1:]
@@ -593,7 +593,7 @@ create_worktree() {
     local branch_safe="${BRANCH//\//-}"
     WORKTREE_PATH="${explicit_path:-$(dirname "$SOURCE_DIR")/$(basename "$SOURCE_DIR")-${branch_safe}}"
     # Store absolute paths, so --remove and --list work from any directory
-    WORKTREE_PATH="$(python3 -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$WORKTREE_PATH")"
+    WORKTREE_PATH="$(python3 -I -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$WORKTREE_PATH")"
     [[ -z "$explicit_path" ]] || explicit_path="$WORKTREE_PATH"
 
     WT_ID=""
@@ -702,7 +702,7 @@ case "$ACTION" in
     update)  self_update ;;
     version)
         if $JSON; then
-            python3 -c 'import json, sys; print(json.dumps({"version": sys.argv[1]}))' "$(get_local_version)"
+            python3 -I -c 'import json, sys; print(json.dumps({"version": sys.argv[1]}))' "$(get_local_version)"
         else
             echo "git-worktree-manager $(get_local_version)"
         fi ;;
