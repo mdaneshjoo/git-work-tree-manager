@@ -23,6 +23,7 @@ Every untracked or gitignored path in the repo is checked by name, **at any dept
 | **Python** | Any virtualenv (dir with `bin/activate`, with path fixup), `.python-version` |
 | **Go** | `vendor`, `.air.toml`, `tmp` (when next to `.air.toml`) |
 | **iOS / Xcode** | `Pods`, `.build`, `.swiftpm`, `Carthage`, `*.xcworkspace`, `*.xcconfig`, `GoogleService-Info.plist`, `firebase.json` |
+| **Husky** | `.husky/_` (gitignored helper dir that `core.hooksPath` points at) |
 | **All** | `.env`, `.env.*`, `.editorconfig`, `.tool-versions`, `.nvmrc`, `.node-version`, `.ruby-version`, `.mise.toml`, `.mise.local.toml`, `docker-compose.override.yml`, `.docker-env` |
 
 Tracked files are never copied (they are already in the checkout). Paths that already exist in the worktree are skipped.

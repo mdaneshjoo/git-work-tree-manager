@@ -394,6 +394,9 @@ classify_path() {
             echo "link"
         elif [[ "$name" == "tmp" && -f "$parent/.air.toml" ]] || [[ "$name" == *.xcworkspace ]]; then
             echo "copy"
+        elif [[ "$name" == "_" && "$(basename "$parent")" == ".husky" ]]; then
+            # Husky's gitignored helper dir; core.hooksPath=.husky/_ finds no hooks without it
+            echo "copy"
         fi
     else
         case "$name" in
@@ -494,7 +497,7 @@ copy_runtime_files() {
         if [[ "$kind" == "venv" ]] && ! $DRY_RUN && ! $link; then
             fix_venv_paths "$rel"
         fi
-    done < <(list_untracked_paths)
+    done < <(list_untracked_paths | sort -zu)
 
     if [[ $found -eq 0 ]]; then
         warn "No runtime dependencies found to copy."
