@@ -3,18 +3,55 @@ set -eo pipefail
 
 # git-worktree-manager: Create a git worktree with all runtime dependencies copied over
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-DIM='\033[2m'
-NC='\033[0m'
+# Exit codes (stable, for scripts and AI agents)
+EXIT_OK=0
+EXIT_ERROR=1
+EXIT_USAGE=2
+EXIT_NOT_FOUND=3
+EXIT_CONFIRM=4
 
-log()  { echo -e "${GREEN}[✓]${NC} $1"; }
-warn() { echo -e "${YELLOW}[!]${NC} $1"; }
-info() { echo -e "${CYAN}[i]${NC} $1"; }
-err()  { echo -e "${RED}[✗]${NC} $1" >&2; }
+DRY_RUN=false
+USE_SYMLINK=false
+LIST_ALL=false
+JSON=false
+ASSUME_YES=false
+BASE_BRANCH=""
+
+# --json is honored before argument parsing, so even usage errors come back as JSON
+for arg in "$@"; do
+    [[ "$arg" == "--json" ]] && JSON=true
+done
+
+# Colors only when stderr is a terminal and NO_COLOR is unset
+if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then
+    RED=$'\033[0;31m'
+    GREEN=$'\033[0;32m'
+    YELLOW=$'\033[1;33m'
+    CYAN=$'\033[0;36m'
+    BOLD=$'\033[1m'
+    DIM=$'\033[2m'
+    NC=$'\033[0m'
+else
+    RED='' GREEN='' YELLOW='' CYAN='' BOLD='' DIM='' NC=''
+fi
+
+# Messages go to stderr; stdout carries only results (worktree path, list, JSON).
+# With --json, progress messages are dropped and only warnings/errors remain.
+log()   { $JSON || printf '%s\n' "${GREEN}[✓]${NC} $1" >&2; }
+info()  { $JSON || printf '%s\n' "${CYAN}[i]${NC} $1" >&2; }
+blank() { $JSON || echo "" >&2; }
+warn()  { printf '%s\n' "${YELLOW}[!]${NC} $1" >&2; }
+err()   { printf '%s\n' "${RED}[✗]${NC} $1" >&2; }
+
+# Print an error and exit with the given code; with --json also print {"error", "exit_code"} on stdout
+die() {
+    local code="$1" msg="$2"
+    err "$msg"
+    if $JSON; then
+        python3 -c 'import json, sys; print(json.dumps({"error": sys.argv[1], "exit_code": int(sys.argv[2])}))' "$msg" "$code"
+    fi
+    exit "$code"
+}
 
 # --- Registry: stores worktree ID -> metadata ---
 REGISTRY_DIR="$HOME/.config/git-worktree-manager"
@@ -24,84 +61,79 @@ GITHUB_REPO="git-work-tree-manager"
 GITHUB_API="https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}"
 VERSION_FILE="$REGISTRY_DIR/version"
 
-init_registry() {
+# All registry access goes through here. Values are passed as argv (never pasted into code),
+# and each call holds an exclusive lock, so parallel runs (e.g. several agents) don't lose entries.
+#   registry add <repo> <branch> <path> <created_at>   -> prints the new unique ID
+#   registry remove <id>
+#   registry find <id|branch|path> [repo]              -> id<TAB>repo<TAB>branch<TAB>path
+#   registry find-branch <repo> <branch>               -> same format
+#   registry list <repo|""> <table|json>
+registry() {
     mkdir -p "$REGISTRY_DIR"
-    [[ -f "$REGISTRY_FILE" ]] || echo '[]' > "$REGISTRY_FILE"
-}
+    python3 - "$REGISTRY_FILE" "$@" <<'PY'
+import fcntl, json, os, random, string, sys, tempfile
 
-generate_id() {
-    # 6-char alphanumeric ID
-    LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom 2>/dev/null | head -c 6 || true
-}
+path, op, args = sys.argv[1], sys.argv[2], sys.argv[3:]
 
-registry_add() {
-    local id="$1" repo="$2" branch="$3" path="$4" created_at="$5"
-    init_registry
+with open(path + ".lock", "w") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        data = []
 
-    # Use python for portable JSON manipulation (available on macOS)
-    python3 -c "
-import json, sys
-with open('$REGISTRY_FILE', 'r') as f:
-    data = json.load(f)
-data.append({
-    'id': '$id',
-    'repo': '$repo',
-    'branch': '$branch',
-    'path': '$path',
-    'created_at': '$created_at'
-})
-with open('$REGISTRY_FILE', 'w') as f:
-    json.dump(data, f, indent=2)
-"
-}
+    def save():
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
 
-registry_remove() {
-    local id="$1"
-    init_registry
-    python3 -c "
-import json
-with open('$REGISTRY_FILE', 'r') as f:
-    data = json.load(f)
-data = [e for e in data if e['id'] != '$id']
-with open('$REGISTRY_FILE', 'w') as f:
-    json.dump(data, f, indent=2)
-"
-}
+    def row(e):
+        return "\t".join([e["id"], e["repo"], e["branch"], e["path"]])
 
-registry_find() {
-    # Find entry by ID, branch, or path. Outputs: id|repo|branch|path
-    local target="$1"
-    init_registry
-    python3 -c "
-import json, sys
-with open('$REGISTRY_FILE', 'r') as f:
-    data = json.load(f)
-for e in data:
-    if e['id'] == '$target' or e['branch'] == '$target' or e['path'] == '$target':
-        print(e['id'] + '|' + e['repo'] + '|' + e['branch'] + '|' + e['path'])
-        sys.exit(0)
-sys.exit(1)
-" 2>/dev/null
-}
-
-registry_list() {
-    local repo_filter="${1:-}"
-    init_registry
-    python3 -c "
-import json
-with open('$REGISTRY_FILE', 'r') as f:
-    data = json.load(f)
-repo_filter = '$repo_filter'
-entries = [e for e in data if not repo_filter or e['repo'] == repo_filter]
-if not entries:
-    print('  No worktrees registered.')
-else:
-    # Header
-    print(f'  {\"ID\":<8} {\"Branch\":<25} {\"Created\":<20} Path')
-    print(f'  {\"──\":<8} {\"──────\":<25} {\"───────\":<20} ────')
-    for e in entries:
-        print(f'  {e[\"id\"]:<8} {e[\"branch\"]:<25} {e.get(\"created_at\",\"?\"):<20} {e[\"path\"]}')
-"
+    if op == "add":
+        repo, branch, wt_path, created_at = args
+        ids = {e["id"] for e in data}
+        while True:
+            new_id = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(6))
+            if new_id not in ids:
+                break
+        data.append({"id": new_id, "repo": repo, "branch": branch, "path": wt_path, "created_at": created_at})
+        save()
+        print(new_id)
+    elif op == "remove":
+        data = [e for e in data if e["id"] != args[0]]
+        save()
+    elif op == "find":
+        # IDs and paths are unique across repos; a branch name only matches inside the given repo
+        target, repo = args[0], (args[1] if len(args) > 1 else "")
+        for e in data:
+            if target in (e["id"], e["path"]):
+                print(row(e)); sys.exit(0)
+        for e in data:
+            if e["branch"] == target and (not repo or e["repo"] == repo):
+                print(row(e)); sys.exit(0)
+        sys.exit(1)
+    elif op == "find-branch":
+        repo, branch = args
+        for e in data:
+            if e["repo"] == repo and e["branch"] == branch:
+                print(row(e)); sys.exit(0)
+        sys.exit(1)
+    elif op == "list":
+        repo, fmt = args
+        entries = [e for e in data if not repo or e["repo"] == repo]
+        if fmt == "json":
+            print(json.dumps(entries, indent=2))
+        elif not entries:
+            print("  No worktrees registered.")
+        else:
+            print(f'  {"ID":<8} {"Branch":<25} {"Created":<20} Path')
+            print(f'  {"──":<8} {"──────":<25} {"───────":<20} ────')
+            for e in entries:
+                print(f'  {e["id"]:<8} {e["branch"]:<25} {e.get("created_at", "?"):<20} {e["path"]}')
+PY
 }
 
 # --- GitHub helpers ---
@@ -112,8 +144,7 @@ github_get() {
     elif command -v wget &>/dev/null; then
         wget -qO- "$url" 2>/dev/null
     else
-        err "curl or wget is required."
-        exit 1
+        die $EXIT_ERROR "curl or wget is required."
     fi
 }
 
@@ -203,10 +234,10 @@ self_update() {
 
 # --- Usage ---
 usage() {
-    cat <<EOF
+    cat <<USAGE
 Usage: $(basename "$0") [options] <branch> [worktree-path]
-       $(basename "$0") --remove <id|branch|path>
-       $(basename "$0") --list
+       $(basename "$0") --remove <id|branch|path> [--yes]
+       $(basename "$0") --list [--all]
        $(basename "$0") --update
 
 Create a git worktree and copy runtime dependencies so the project is immediately runnable.
@@ -221,6 +252,7 @@ Copied from anywhere in the repo (monorepo packages included), if untracked:
   - Python          (any virtualenv, .python-version)
   - Go              (vendor, .air.toml, tmp)
   - iOS / Xcode     (Pods, .build, .swiftpm, Carthage, .xcworkspace, .xcconfig)
+  - Husky           (.husky/_ helper dir)
   - All             (.env, .env.*, .tool-versions, .nvmrc, .mise.toml, ...)
 
 Options:
@@ -229,141 +261,112 @@ Options:
   --base, -b      Base branch to create the new branch from (default: current HEAD)
   --symlink       Use symlinks instead of copies for large dirs (node_modules, vendor, Pods)
   --remove, -r    Remove a worktree by ID, branch name, or path (also deletes the branch)
+  --yes, -y       Don't ask for confirmation (required for --remove without a terminal)
   --list, -l      List all registered worktrees (current repo only, or --all for all repos)
   --all           Used with --list to show worktrees from all repos
+  --json          Print results as JSON on stdout (progress messages are suppressed)
   --update        Update to the latest version from GitHub
   --version, -v   Show the current version
-EOF
+
+Output:
+  stdout          Results only: the worktree path, the --list table, or JSON
+  stderr          Progress messages, warnings, errors (no colors when not a terminal or NO_COLOR is set)
+
+Creating a worktree for a branch that already has one returns the existing worktree (same ID and path).
+
+Exit codes:
+  0  success              3  worktree not found (--remove)
+  1  error                4  confirmation required or declined (--remove)
+  2  invalid usage
+USAGE
     exit 0
 }
-
-DRY_RUN=false
-USE_SYMLINK=false
-LIST_ALL=false
-BASE_BRANCH=""
 
 # --- Remove worktree ---
 remove_worktree() {
     local target="$1"
+    local current_repo entry wt_id wt_repo wt_branch wt_path branch_deleted=false
 
-    SOURCE_DIR="$(git rev-parse --show-toplevel 2>/dev/null)" || {
-        err "Not inside a git repository"
-        exit 1
-    }
+    current_repo="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+    entry=$(registry find "$target" "$current_repo") ||
+        die $EXIT_NOT_FOUND "Worktree not found for: $target (use --list to see registered worktrees)"
+    IFS=$'\t' read -r wt_id wt_repo wt_branch wt_path <<< "$entry"
 
-    # Look up in registry first
-    local entry
-    if entry=$(registry_find "$target"); then
-        IFS='|' read -r wt_id wt_repo wt_branch wt_path <<< "$entry"
-    else
-        err "Worktree not found for: $target"
-        info "Use --list to see registered worktrees"
-        exit 1
-    fi
-
-    echo ""
+    blank
     info "ID:       ${BOLD}$wt_id${NC}"
     info "Branch:   $wt_branch"
     info "Path:     $wt_path"
     info "Repo:     $wt_repo"
-    echo ""
+    blank
 
-    # Confirm removal
-    echo -en "${YELLOW}[?]${NC} Remove this worktree and delete branch '${wt_branch}'? [y/N] "
-    read -r confirm
-    if [[ "$confirm" != [yY] && "$confirm" != [yY][eE][sS] ]]; then
-        warn "Aborted."
-        exit 0
+    if ! $ASSUME_YES; then
+        [[ -t 0 ]] || die $EXIT_CONFIRM "Confirmation required: re-run with --yes to remove worktree $wt_id and delete branch '$wt_branch'"
+        printf '%s' "${YELLOW}[?]${NC} Remove this worktree and delete branch '${wt_branch}'? [y/N] " >&2
+        local confirm
+        read -r confirm || confirm=""
+        if [[ "$confirm" != [yY] && "$confirm" != [yY][eE][sS] ]]; then
+            warn "Aborted."
+            exit $EXIT_CONFIRM
+        fi
     fi
 
-    # Remove the worktree
+    # Run git in the worktree's own repo, which may differ from the current directory
     if [[ -d "$wt_path" ]]; then
-        git worktree remove "$wt_path" --force 2>/dev/null || {
+        git -C "$wt_repo" worktree remove "$wt_path" --force >/dev/null 2>&1 || {
             warn "git worktree remove failed, cleaning up manually..."
             rm -rf "$wt_path"
-            git worktree prune
+            git -C "$wt_repo" worktree prune
         }
         log "Worktree removed: $wt_path"
     else
         warn "Worktree directory already gone: $wt_path"
-        git worktree prune 2>/dev/null || true
+        git -C "$wt_repo" worktree prune 2>/dev/null || true
     fi
 
-    # Delete the branch
-    if [[ -n "$wt_branch" ]]; then
-        if git rev-parse --verify "$wt_branch" >/dev/null 2>&1; then
-            git branch -D "$wt_branch" 2>/dev/null && log "Branch deleted: $wt_branch" || warn "Could not delete branch: $wt_branch"
+    if [[ -n "$wt_branch" ]] && git -C "$wt_repo" rev-parse --verify "$wt_branch" >/dev/null 2>&1; then
+        if git -C "$wt_repo" branch -D "$wt_branch" >/dev/null 2>&1; then
+            branch_deleted=true
+            log "Branch deleted: $wt_branch"
+        else
+            warn "Could not delete branch: $wt_branch"
         fi
     fi
 
-    # Remove from registry
-    registry_remove "$wt_id"
+    registry remove "$wt_id"
     log "Removed from registry: $wt_id"
 
-    echo ""
-    log "Cleanup complete."
-    exit 0
+    if $JSON; then
+        python3 -c 'import json, sys; a = sys.argv; print(json.dumps({"id": a[1], "repo": a[2], "branch": a[3], "path": a[4], "removed": True, "branch_deleted": a[5] == "true"}, indent=2))' \
+            "$wt_id" "$wt_repo" "$wt_branch" "$wt_path" "$branch_deleted"
+    else
+        blank
+        log "Cleanup complete."
+    fi
+    exit $EXIT_OK
 }
 
 # --- List worktrees ---
 list_worktrees() {
-    echo ""
-
-    if $LIST_ALL; then
-        info "All registered worktrees:"
-        echo ""
-        registry_list ""
-    else
-        SOURCE_DIR="$(git rev-parse --show-toplevel 2>/dev/null)" || {
-            err "Not inside a git repository"
-            exit 1
-        }
-        info "Worktrees for ${BOLD}$(basename "$SOURCE_DIR")${NC}:"
-        echo ""
-        registry_list "$SOURCE_DIR"
+    local repo=""
+    if ! $LIST_ALL; then
+        repo="$(git rev-parse --show-toplevel 2>/dev/null)" || die $EXIT_ERROR "Not inside a git repository (use --all to list every repo)"
     fi
 
-    echo ""
-    exit 0
+    if $JSON; then
+        registry list "$repo" json
+    else
+        blank
+        if $LIST_ALL; then
+            info "All registered worktrees:"
+        else
+            info "Worktrees for ${BOLD}$(basename "$repo")${NC}:"
+        fi
+        blank
+        registry list "$repo" table
+        blank
+    fi
+    exit $EXIT_OK
 }
-
-# --- Parse args ---
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -h|--help)        usage ;;
-        -n|--dry-run)     DRY_RUN=true; shift ;;
-        --symlink)        USE_SYMLINK=true; shift ;;
-        --all)            LIST_ALL=true; shift ;;
-        --update)         self_update ;;
-        --version|-v)     echo "git-worktree-manager $(get_local_version)"; exit 0 ;;
-        --base|-b)        shift; [[ $# -lt 1 ]] && { err "Missing argument for --base"; exit 1; }; BASE_BRANCH="$1"; shift ;;
-        --remove|-r)      shift; [[ $# -lt 1 ]] && { err "Missing argument for --remove"; exit 1; }; remove_worktree "$1" ;;
-        --list|-l)        list_worktrees ;;
-        -*)               err "Unknown option: $1"; usage ;;
-        *)                break ;;
-    esac
-done
-
-# --list with --all (handle if --all comes before --list)
-if $LIST_ALL; then
-    list_worktrees
-fi
-
-if [[ $# -lt 1 ]]; then
-    err "Missing required argument: branch"
-    usage
-fi
-
-BRANCH="$1"
-if ! SOURCE_DIR="$(git rev-parse --show-toplevel 2>/dev/null)"; then
-    err "Not inside a git repository. cd into your project first."
-    exit 1
-fi
-
-PROJECT_NAME="$(basename "$SOURCE_DIR")"
-# Replace / in branch names with - for the directory name
-BRANCH_SAFE="${BRANCH//\//-}"
-WORKTREE_PATH="${2:-$(dirname "$SOURCE_DIR")/${PROJECT_NAME}-${BRANCH_SAFE}}"
 
 # --- Runtime files to copy ---
 # Matched by name at any depth, so monorepo packages (apps/*/node_modules, apps/api/.env, ...) are covered.
@@ -427,6 +430,7 @@ copy_item() {
 
     if [[ -e "$dst" || -L "$dst" ]]; then
         warn "Skipped (already exists in worktree): $name"
+        SKIPPED+=("exists	$name")
         return
     fi
 
@@ -435,10 +439,17 @@ copy_item() {
     while [[ "$parent" != "$WORKTREE_PATH" && "$parent" == "$WORKTREE_PATH"/* ]]; do
         if [[ -L "$parent" ]]; then
             warn "Skipped (parent is a symlink in worktree): $name"
+            SKIPPED+=("symlinked_parent	$name")
             return
         fi
         parent="$(dirname "$parent")"
     done
+
+    if [[ "$use_link" == "true" ]]; then
+        COPIED+=("symlink	$name")
+    else
+        COPIED+=("copy	$name")
+    fi
 
     if $DRY_RUN; then
         if [[ "$use_link" == "true" ]]; then
@@ -535,63 +546,167 @@ fix_husky_hooks() {
     fi
 }
 
-# --- Main ---
-main() {
-    local WT_ID
-    WT_ID=$(generate_id)
-    local CREATED_AT
-    CREATED_AT=$(date '+%Y-%m-%d %H:%M')
+# --- Result output ---
+print_result() {
+    local created="$1"
 
-    echo ""
-    info "ID:       ${BOLD}$WT_ID${NC}"
-    info "Source:   $SOURCE_DIR"
-    info "Branch:   $BRANCH"
-    info "Worktree: $WORKTREE_PATH"
-    echo ""
-
-    # Create the worktree
-    if $DRY_RUN; then
-        info "[dry-run] Would create worktree at $WORKTREE_PATH for branch $BRANCH"
-    else
-        if git rev-parse --verify "$BRANCH" >/dev/null 2>&1; then
-            if [[ -n "$BASE_BRANCH" ]]; then
-                warn "Branch '$BRANCH' already exists, ignoring --base option."
-            fi
-            git worktree add "$WORKTREE_PATH" "$BRANCH"
-        else
-            if [[ -n "$BASE_BRANCH" ]]; then
-                if ! git rev-parse --verify "$BASE_BRANCH" >/dev/null 2>&1; then
-                    err "Base branch '$BASE_BRANCH' does not exist."
-                    exit 1
-                fi
-                info "Branch '$BRANCH' does not exist, creating from '$BASE_BRANCH'..."
-                git worktree add -b "$BRANCH" "$WORKTREE_PATH" "$BASE_BRANCH"
-            else
-                info "Branch '$BRANCH' does not exist, creating from current HEAD..."
-                git worktree add -b "$BRANCH" "$WORKTREE_PATH"
-            fi
-        fi
-        log "Worktree created at $WORKTREE_PATH"
-
-        # Register in registry
-        registry_add "$WT_ID" "$SOURCE_DIR" "$BRANCH" "$WORKTREE_PATH" "$CREATED_AT"
-        log "Registered with ID: ${BOLD}$WT_ID${NC}"
+    if $JSON; then
+        python3 - "$WT_ID" "$SOURCE_DIR" "$BRANCH" "$WORKTREE_PATH" "$created" "$DRY_RUN" \
+            "${#COPIED[@]}" ${COPIED[@]+"${COPIED[@]}"} ${SKIPPED[@]+"${SKIPPED[@]}"} <<'PY'
+import json, sys
+a = sys.argv[1:]
+n = int(a[6])
+items = lambda rows, key: [dict(zip((key, "path"), r.split("\t", 1))) for r in rows]
+print(json.dumps({
+    "id": a[0] or None, "repo": a[1], "branch": a[2], "path": a[3],
+    "created": a[4] == "true", "dry_run": a[5] == "true",
+    "copied": items(a[7:7 + n], "mode"),
+    "skipped": items(a[7 + n:], "reason"),
+}, indent=2))
+PY
+        return
     fi
 
-    echo ""
-
-    copy_runtime_files
-    fix_husky_hooks
-
-    echo ""
+    blank
     if $DRY_RUN; then
         warn "Dry run complete. No changes were made."
     else
         log "Done! Your worktree is ready at:"
-        echo -e "   ${CYAN}cd $WORKTREE_PATH${NC}"
-        echo ""
-        echo -e "   To remove later: ${DIM}git-worktree-manager -r $WT_ID${NC}"
+        info "   ${CYAN}cd $WORKTREE_PATH${NC}"
+        info "   To remove later: ${DIM}git-worktree-manager -r $WT_ID${NC}"
     fi
+    # The path is the only thing on stdout, so `cd "$(git-worktree-manager <branch>)"` works
+    printf '%s\n' "$WORKTREE_PATH"
 }
 
-main
+# --- Create worktree ---
+create_worktree() {
+    [[ ${#POSITIONAL[@]} -ge 1 ]] || die $EXIT_USAGE "Missing required argument: branch (see --help)"
+    [[ ${#POSITIONAL[@]} -le 2 ]] || die $EXIT_USAGE "Too many arguments: ${POSITIONAL[*]} (see --help)"
+
+    BRANCH="${POSITIONAL[0]}"
+    local explicit_path="${POSITIONAL[1]:-}"
+    SOURCE_DIR="$(git rev-parse --show-toplevel 2>/dev/null)" ||
+        die $EXIT_ERROR "Not inside a git repository. cd into your project first."
+
+    # Replace / in branch names with - for the directory name
+    local branch_safe="${BRANCH//\//-}"
+    WORKTREE_PATH="${explicit_path:-$(dirname "$SOURCE_DIR")/$(basename "$SOURCE_DIR")-${branch_safe}}"
+    # Store absolute paths, so --remove and --list work from any directory
+    WORKTREE_PATH="$(python3 -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$WORKTREE_PATH")"
+    [[ -z "$explicit_path" ]] || explicit_path="$WORKTREE_PATH"
+
+    WT_ID=""
+    COPIED=()
+    SKIPPED=()
+
+    # Idempotent: a branch that already has a registered worktree is returned as is
+    local existing e_id e_repo e_branch e_path
+    if existing=$(registry find-branch "$SOURCE_DIR" "$BRANCH"); then
+        IFS=$'\t' read -r e_id e_repo e_branch e_path <<< "$existing"
+        if [[ -d "$e_path" ]] && git -C "$e_path" rev-parse --git-dir >/dev/null 2>&1; then
+            if [[ -n "$explicit_path" && "$explicit_path" != "$e_path" ]]; then
+                die $EXIT_ERROR "Branch '$BRANCH' already has a worktree at $e_path"
+            fi
+            WT_ID="$e_id"
+            WORKTREE_PATH="$e_path"
+            info "Worktree for '$BRANCH' already exists (ID ${BOLD}$WT_ID${NC}), reusing it"
+            print_result false
+            exit $EXIT_OK
+        fi
+        warn "Dropping stale registry entry $e_id (directory is gone): $e_path"
+        if ! $DRY_RUN; then
+            registry remove "$e_id"
+            git -C "$SOURCE_DIR" worktree prune 2>/dev/null || true
+        fi
+    fi
+
+    blank
+    info "Source:   $SOURCE_DIR"
+    info "Branch:   $BRANCH"
+    info "Worktree: $WORKTREE_PATH"
+    blank
+
+    if $DRY_RUN; then
+        info "[dry-run] Would create worktree at $WORKTREE_PATH for branch $BRANCH"
+    else
+        # git's own output goes to stderr, keeping stdout for results
+        if git rev-parse --verify "$BRANCH" >/dev/null 2>&1; then
+            if [[ -n "$BASE_BRANCH" ]]; then
+                warn "Branch '$BRANCH' already exists, ignoring --base option."
+            fi
+            git worktree add "$WORKTREE_PATH" "$BRANCH" >&2 ||
+                die $EXIT_ERROR "git worktree add failed for branch '$BRANCH'"
+        else
+            if [[ -n "$BASE_BRANCH" ]]; then
+                git rev-parse --verify "$BASE_BRANCH" >/dev/null 2>&1 ||
+                    die $EXIT_ERROR "Base branch '$BASE_BRANCH' does not exist."
+                info "Branch '$BRANCH' does not exist, creating from '$BASE_BRANCH'..."
+                git worktree add -b "$BRANCH" "$WORKTREE_PATH" "$BASE_BRANCH" >&2 ||
+                    die $EXIT_ERROR "git worktree add failed for branch '$BRANCH'"
+            else
+                info "Branch '$BRANCH' does not exist, creating from current HEAD..."
+                git worktree add -b "$BRANCH" "$WORKTREE_PATH" >&2 ||
+                    die $EXIT_ERROR "git worktree add failed for branch '$BRANCH'"
+            fi
+        fi
+        log "Worktree created at $WORKTREE_PATH"
+
+        WT_ID=$(registry add "$SOURCE_DIR" "$BRANCH" "$WORKTREE_PATH" "$(date '+%Y-%m-%d %H:%M')")
+        log "Registered with ID: ${BOLD}$WT_ID${NC}"
+    fi
+
+    blank
+
+    copy_runtime_files
+    fix_husky_hooks
+
+    print_result true
+}
+
+# --- Parse args ---
+ACTION="create"
+REMOVE_TARGET=""
+POSITIONAL=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)        usage ;;
+        -n|--dry-run)     DRY_RUN=true ;;
+        --symlink)        USE_SYMLINK=true ;;
+        --all)            LIST_ALL=true ;;
+        --json)           JSON=true ;;
+        -y|--yes)         ASSUME_YES=true ;;
+        --update)         ACTION="update" ;;
+        --version|-v)     ACTION="version" ;;
+        --list|-l)        ACTION="list" ;;
+        --base|-b)
+            [[ $# -ge 2 ]] || die $EXIT_USAGE "Missing argument for --base"
+            BASE_BRANCH="$2"; shift ;;
+        --remove|-r)
+            [[ $# -ge 2 ]] || die $EXIT_USAGE "Missing argument for --remove"
+            ACTION="remove"; REMOVE_TARGET="$2"; shift ;;
+        --)               shift; POSITIONAL+=("$@"); break ;;
+        -*)               die $EXIT_USAGE "Unknown option: $1 (see --help)" ;;
+        *)                POSITIONAL+=("$1") ;;
+    esac
+    shift
+done
+
+# --all alone means --list --all
+if $LIST_ALL && [[ "$ACTION" == "create" && ${#POSITIONAL[@]} -eq 0 ]]; then
+    ACTION="list"
+fi
+
+case "$ACTION" in
+    update)  self_update ;;
+    version)
+        if $JSON; then
+            python3 -c 'import json, sys; print(json.dumps({"version": sys.argv[1]}))' "$(get_local_version)"
+        else
+            echo "git-worktree-manager $(get_local_version)"
+        fi ;;
+    list)    list_worktrees ;;
+    remove)  remove_worktree "$REMOVE_TARGET" ;;
+    create)  create_worktree ;;
+esac
