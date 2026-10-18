@@ -427,6 +427,16 @@ copy_item() {
         return
     fi
 
+    # A symlinked parent (e.g. a tracked "apps -> /elsewhere") would make the copy land outside the worktree
+    local parent="$(dirname "$dst")"
+    while [[ "$parent" != "$WORKTREE_PATH" && "$parent" == "$WORKTREE_PATH"/* ]]; do
+        if [[ -L "$parent" ]]; then
+            warn "Skipped (parent is a symlink in worktree): $name"
+            return
+        fi
+        parent="$(dirname "$parent")"
+    done
+
     if $DRY_RUN; then
         if [[ "$use_link" == "true" ]]; then
             info "[dry-run] Would symlink: $name"
