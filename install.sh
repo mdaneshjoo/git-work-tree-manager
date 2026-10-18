@@ -89,7 +89,7 @@ else
             exit 1
         fi
     )
-    INSTALL_VERSION=$(python3 -c "import json,sys; print(json.loads(sys.stdin.read()).get('tag_name',''))" <<< "$LATEST_RELEASE")
+    INSTALL_VERSION=$(python3 -I -c "import json,sys; print(json.loads(sys.stdin.read()).get('tag_name',''))" <<< "$LATEST_RELEASE")
 
     if [[ -z "$INSTALL_VERSION" ]]; then
         warn "No releases found, falling back to master branch..."
