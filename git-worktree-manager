@@ -216,11 +216,12 @@ Arguments:
   branch          Branch name for the worktree (created if it doesn't exist)
   worktree-path   Optional path for the worktree (default: ../\$(basename \$PWD)-<branch>)
 
-Supported project types (auto-detected):
-  - Node.js / React (node_modules, .env, .env.local, etc.)
-  - Python          (venv, .venv, .env, __pycache__)
-  - Go              (vendor, .env)
-  - iOS / Xcode     (Pods, .swiftpm, Carthage, .xcworkspace, .env)
+Copied from anywhere in the repo (monorepo packages included), if untracked:
+  - Node.js / React (node_modules, .next, .nuxt, .turbo, dist, build)
+  - Python          (any virtualenv, .python-version)
+  - Go              (vendor, .air.toml, tmp)
+  - iOS / Xcode     (Pods, .build, .swiftpm, Carthage, .xcworkspace, .xcconfig)
+  - All             (.env, .env.*, .tool-versions, .nvmrc, .mise.toml, ...)
 
 Options:
   -h, --help      Show this help message
@@ -364,25 +365,50 @@ PROJECT_NAME="$(basename "$SOURCE_DIR")"
 BRANCH_SAFE="${BRANCH//\//-}"
 WORKTREE_PATH="${2:-$(dirname "$SOURCE_DIR")/${PROJECT_NAME}-${BRANCH_SAFE}}"
 
-# --- Detect project types (a project can be multiple types) ---
-declare -a PROJECT_TYPES=()
+# --- Runtime files to copy ---
+# Matched by name at any depth, so monorepo packages (apps/*/node_modules, apps/api/.env, ...) are covered.
+# Large dependency dirs (symlinked instead of copied with --symlink)
+DEP_DIRS="node_modules vendor Pods Carthage .build .swiftpm"
+# Build caches, only copied when they sit next to a package.json
+CACHE_DIRS=".next .nuxt .turbo dist build"
+CONFIG_FILES=".python-version .air.toml .editorconfig .tool-versions .nvmrc .node-version \
+.ruby-version .mise.toml .mise.local.toml docker-compose.override.yml .docker-env \
+GoogleService-Info.plist firebase.json"
 
-detect_projects() {
-    [[ -f "$SOURCE_DIR/package.json" ]]      && PROJECT_TYPES+=("nodejs")
-    [[ -f "$SOURCE_DIR/go.mod" ]]            && PROJECT_TYPES+=("golang")
-    [[ -f "$SOURCE_DIR/Podfile" ]]           && PROJECT_TYPES+=("ios")
-    [[ -f "$SOURCE_DIR/requirements.txt" || -f "$SOURCE_DIR/pyproject.toml" || -f "$SOURCE_DIR/Pipfile" || -f "$SOURCE_DIR/setup.py" ]] && PROJECT_TYPES+=("python")
+has_word() { [[ " $2 " == *" $1 "* ]]; }
 
-    # Check for monorepo with multiple package.json (React/Next.js)
-    if [[ -f "$SOURCE_DIR/package.json" ]]; then
-        if grep -qE '"react"|"next"|"vue"|"angular"' "$SOURCE_DIR/package.json" 2>/dev/null; then
-            PROJECT_TYPES+=("react")
+# Prints how to handle a repo-relative path: "venv", "link" (large dir), "copy", or nothing (skip)
+classify_path() {
+    local rel="$1"
+    local src="$SOURCE_DIR/$rel"
+    local name parent
+    name="$(basename "$rel")"
+    parent="$(dirname "$src")"
+
+    if [[ -d "$src" ]]; then
+        if [[ -f "$src/bin/activate" ]]; then
+            echo "venv"
+        elif has_word "$name" "$DEP_DIRS"; then
+            echo "link"
+        elif has_word "$name" "$CACHE_DIRS" && [[ -f "$parent/package.json" ]]; then
+            echo "link"
+        elif [[ "$name" == "tmp" && -f "$parent/.air.toml" ]] || [[ "$name" == *.xcworkspace ]]; then
+            echo "copy"
         fi
+    else
+        case "$name" in
+            .env|.env.*|*.xcconfig) echo "copy" ;;
+            *) has_word "$name" "$CONFIG_FILES" && echo "copy" ;;
+        esac
     fi
+    return 0
+}
 
-    if [[ ${#PROJECT_TYPES[@]} -eq 0 ]]; then
-        warn "No known project type detected. Will only create the worktree."
-    fi
+# NUL-separated untracked paths, relative to the repo root.
+# Ignored dirs are listed once and not descended into (fast even with huge node_modules).
+list_untracked_paths() {
+    git -C "$SOURCE_DIR" ls-files -z --others --ignored --exclude-standard --directory
+    git -C "$SOURCE_DIR" ls-files -z --others --exclude-standard --directory
 }
 
 # --- Copy or symlink a path ---
@@ -393,6 +419,11 @@ copy_item() {
     local use_link="${4:-false}"
 
     if [[ ! -e "$src" ]]; then
+        return
+    fi
+
+    if [[ -e "$dst" || -L "$dst" ]]; then
+        warn "Skipped (already exists in worktree): $name"
         return
     fi
 
@@ -408,7 +439,7 @@ copy_item() {
     mkdir -p "$(dirname "$dst")"
 
     if [[ "$use_link" == "true" ]]; then
-        ln -sf "$src" "$dst"
+        ln -sfn "$src" "$dst"
         log "Symlinked: $name"
     else
         if [[ -d "$src" ]]; then
@@ -421,140 +452,74 @@ copy_item() {
     fi
 }
 
-# --- Copy env files (common to all project types) ---
-copy_env_files() {
-    local src_dir="$1"
-    local dst_dir="$2"
+# --- Python: point a copied virtualenv at its new location ---
+fix_venv_paths() {
+    local rel="$1"
+    local venv="$WORKTREE_PATH/$rel"
+    local f
 
-    for envfile in .env .env.local .env.development .env.development.local \
-                   .env.test .env.test.local .env.production .env.production.local \
-                   .env.staging; do
-        copy_item "$src_dir/$envfile" "$dst_dir/$envfile" "$envfile"
+    for f in "$venv/pyvenv.cfg" "$venv/bin/activate"*; do
+        [[ -f "$f" ]] || continue
+        sed -i.gwm-bak "s|$SOURCE_DIR/$rel|$WORKTREE_PATH/$rel|g" "$f" 2>/dev/null || true
+        rm -f "$f.gwm-bak"
     done
+    log "Fixed virtualenv paths: $rel"
 }
 
-# --- Node.js / React ---
-setup_nodejs() {
-    info "Setting up Node.js dependencies..."
-    local link=$USE_SYMLINK
+# --- Copy all runtime dependencies found anywhere in the repo ---
+copy_runtime_files() {
+    info "Copying runtime dependencies..."
+    local rel kind link found=0
 
-    copy_item "$SOURCE_DIR/node_modules" "$WORKTREE_PATH/node_modules" "node_modules" "$link"
+    while IFS= read -r -d '' rel; do
+        rel="${rel%/}"
+        kind="$(classify_path "$rel")"
+        [[ -n "$kind" ]] || continue
+        found=$((found + 1))
 
-    # Handle monorepo workspaces (e.g., packages/*/node_modules)
-    if [[ -f "$SOURCE_DIR/package.json" ]]; then
-        local workspaces
-        workspaces=$(node -e "
-            const pkg = require('$SOURCE_DIR/package.json');
-            const ws = pkg.workspaces || (pkg.workspaces && pkg.workspaces.packages) || [];
-            const flat = Array.isArray(ws) ? ws : ws.packages || [];
-            flat.forEach(w => console.log(w));
-        " 2>/dev/null || true)
+        link=false
+        [[ "$kind" != "copy" ]] && link=$USE_SYMLINK
+        copy_item "$SOURCE_DIR/$rel" "$WORKTREE_PATH/$rel" "$rel" "$link"
 
-        if [[ -n "$workspaces" ]]; then
-            while IFS= read -r pattern; do
-                for ws_dir in $SOURCE_DIR/$pattern; do
-                    [[ -d "$ws_dir/node_modules" ]] || continue
-                    local rel="${ws_dir#$SOURCE_DIR/}"
-                    copy_item "$ws_dir/node_modules" "$WORKTREE_PATH/$rel/node_modules" "$rel/node_modules" "$link"
-                done
-            done <<< "$workspaces"
+        if [[ "$kind" == "venv" ]] && ! $DRY_RUN && ! $link; then
+            fix_venv_paths "$rel"
         fi
+    done < <(list_untracked_paths)
+
+    if [[ $found -eq 0 ]]; then
+        warn "No runtime dependencies found to copy."
+    fi
+}
+
+# --- Husky: make git hooks work in the worktree without touching the main repo ---
+fix_husky_hooks() {
+    [[ -d "$SOURCE_DIR/.husky" ]] || return 0
+    $DRY_RUN && return 0
+
+    local hooks_path
+    hooks_path="$(git -C "$SOURCE_DIR" config core.hooksPath 2>/dev/null || true)"
+
+    if [[ -z "$hooks_path" || "$hooks_path" != /* ]]; then
+        # Unset (hooks live in the shared .git/hooks) or relative (Husky v9 uses .husky/_):
+        # both already resolve correctly inside the worktree
+        return 0
     fi
 
-    # .next / dist / build caches
-    for cache_dir in .next .nuxt dist build .turbo; do
-        [[ -d "$SOURCE_DIR/$cache_dir" ]] && copy_item "$SOURCE_DIR/$cache_dir" "$WORKTREE_PATH/$cache_dir" "$cache_dir" "$link"
-    done
-
-    copy_env_files "$SOURCE_DIR" "$WORKTREE_PATH"
-
-    # Fix Husky git hooks for worktree
-    if [[ -d "$SOURCE_DIR/.husky" ]] && ! $DRY_RUN; then
-        info "Fixing Husky git hooks for worktree..."
-        # Get the actual git common dir (the main repo's .git directory)
-        local git_common_dir
-        git_common_dir="$(cd "$WORKTREE_PATH" && git rev-parse --git-common-dir)"
-        # Get worktree-specific git dir
-        local git_dir
-        git_dir="$(cd "$WORKTREE_PATH" && git rev-parse --git-dir)"
-
-        # Set core.hooksPath so Husky hooks resolve from the worktree
-        (cd "$WORKTREE_PATH" && git config core.hooksPath "$WORKTREE_PATH/.husky")
-
-        # If husky has an install script in package.json, run it
-        if command -v npx &>/dev/null && [[ -f "$WORKTREE_PATH/.husky/_/husky.sh" || -f "$WORKTREE_PATH/.husky/husky.sh" ]]; then
-            log "Husky hooks path configured for worktree"
-        elif command -v npx &>/dev/null; then
-            (cd "$WORKTREE_PATH" && npx husky 2>/dev/null) && log "Husky re-initialized in worktree" || warn "Could not re-initialize Husky (non-critical)"
+    if [[ "$hooks_path" == "$SOURCE_DIR"/* ]]; then
+        # Absolute path into the main repo: override it for this worktree only.
+        # core.hooksPath in the shared config would change the main repo's hooks too.
+        local wt_hooks="$WORKTREE_PATH/${hooks_path#"$SOURCE_DIR"/}"
+        if git -C "$WORKTREE_PATH" config extensions.worktreeConfig true &&
+           git -C "$WORKTREE_PATH" config --worktree core.hooksPath "$wt_hooks"; then
+            log "Husky hooks path set for this worktree: $wt_hooks"
+        else
+            warn "Could not set a per-worktree Husky hooks path (needs git 2.20+, non-critical)"
         fi
+    elif [[ ! -d "$hooks_path" ]]; then
+        # Left behind by older versions of this tool, which wrote a worktree path into the shared config
+        warn "core.hooksPath points to a missing dir: $hooks_path"
+        warn "Fix with: git -C \"$SOURCE_DIR\" config --unset core.hooksPath && npx husky"
     fi
-}
-
-# --- Python ---
-setup_python() {
-    info "Setting up Python dependencies..."
-
-    for venv_dir in venv .venv env .env_venv; do
-        if [[ -d "$SOURCE_DIR/$venv_dir" && -f "$SOURCE_DIR/$venv_dir/bin/activate" ]]; then
-            copy_item "$SOURCE_DIR/$venv_dir" "$WORKTREE_PATH/$venv_dir" "$venv_dir (virtualenv)" "$USE_SYMLINK"
-
-            if ! $DRY_RUN && ! $USE_SYMLINK && [[ -d "$WORKTREE_PATH/$venv_dir" ]]; then
-                if [[ -f "$WORKTREE_PATH/$venv_dir/pyvenv.cfg" ]]; then
-                    sed -i '' "s|$SOURCE_DIR|$WORKTREE_PATH|g" "$WORKTREE_PATH/$venv_dir/pyvenv.cfg" 2>/dev/null || true
-                fi
-                for activate in "$WORKTREE_PATH/$venv_dir/bin/activate"*; do
-                    [[ -f "$activate" ]] && sed -i '' "s|$SOURCE_DIR/$venv_dir|$WORKTREE_PATH/$venv_dir|g" "$activate" 2>/dev/null || true
-                done
-                log "Fixed virtualenv paths for new location"
-            fi
-        fi
-    done
-
-    copy_item "$SOURCE_DIR/.python-version" "$WORKTREE_PATH/.python-version" ".python-version"
-    copy_env_files "$SOURCE_DIR" "$WORKTREE_PATH"
-}
-
-# --- Go ---
-setup_golang() {
-    info "Setting up Go dependencies..."
-
-    if [[ -d "$SOURCE_DIR/vendor" ]]; then
-        copy_item "$SOURCE_DIR/vendor" "$WORKTREE_PATH/vendor" "vendor" "$USE_SYMLINK"
-    fi
-
-    copy_env_files "$SOURCE_DIR" "$WORKTREE_PATH"
-    copy_item "$SOURCE_DIR/.air.toml" "$WORKTREE_PATH/.air.toml" ".air.toml"
-    [[ -d "$SOURCE_DIR/tmp" ]] && copy_item "$SOURCE_DIR/tmp" "$WORKTREE_PATH/tmp" "tmp (build cache)"
-}
-
-# --- iOS / Xcode ---
-setup_ios() {
-    info "Setting up iOS dependencies..."
-
-    if [[ -d "$SOURCE_DIR/Pods" ]]; then
-        copy_item "$SOURCE_DIR/Pods" "$WORKTREE_PATH/Pods" "Pods" "$USE_SYMLINK"
-    fi
-
-    for spm_dir in .build .swiftpm; do
-        [[ -d "$SOURCE_DIR/$spm_dir" ]] && copy_item "$SOURCE_DIR/$spm_dir" "$WORKTREE_PATH/$spm_dir" "$spm_dir" "$USE_SYMLINK"
-    done
-
-    [[ -d "$SOURCE_DIR/Carthage" ]] && copy_item "$SOURCE_DIR/Carthage" "$WORKTREE_PATH/Carthage" "Carthage" "$USE_SYMLINK"
-
-    for xcdir in "$SOURCE_DIR"/*.xcworkspace; do
-        [[ -d "$xcdir" ]] || continue
-        local name="$(basename "$xcdir")"
-        copy_item "$xcdir" "$WORKTREE_PATH/$name" "$name"
-    done
-
-    copy_env_files "$SOURCE_DIR" "$WORKTREE_PATH"
-
-    for cfg in GoogleService-Info.plist firebase.json .xcconfig; do
-        find "$SOURCE_DIR" -maxdepth 3 -name "$cfg" -not -path "*/Pods/*" 2>/dev/null | while read -r f; do
-            local rel="${f#$SOURCE_DIR/}"
-            copy_item "$f" "$WORKTREE_PATH/$rel" "$rel"
-        done
-    done
 }
 
 # --- Main ---
@@ -569,10 +534,6 @@ main() {
     info "Source:   $SOURCE_DIR"
     info "Branch:   $BRANCH"
     info "Worktree: $WORKTREE_PATH"
-    echo ""
-
-    detect_projects
-    info "Detected project types: ${PROJECT_TYPES[*]:-none}"
     echo ""
 
     # Create the worktree
@@ -606,23 +567,8 @@ main() {
 
     echo ""
 
-    # Copy dependencies per project type
-    for ptype in "${PROJECT_TYPES[@]}"; do
-        case "$ptype" in
-            nodejs|react) setup_nodejs ;;
-            python)       setup_python ;;
-            golang)       setup_golang ;;
-            ios)          setup_ios ;;
-        esac
-    done
-
-    # Always copy common config files
-    info "Copying common config files..."
-    for common in .editorconfig .tool-versions .nvmrc .node-version \
-                  .ruby-version .mise.toml .mise.local.toml \
-                  docker-compose.override.yml .docker-env; do
-        copy_item "$SOURCE_DIR/$common" "$WORKTREE_PATH/$common" "$common"
-    done
+    copy_runtime_files
+    fix_husky_hooks
 
     echo ""
     if $DRY_RUN; then

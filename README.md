@@ -6,28 +6,37 @@ Standard `git worktree add` only checks out the source code. It doesn't copy `no
 
 ## Features
 
-- Auto-detects project type and copies the right dependencies
+- Finds runtime dependencies anywhere in the repo and copies them
 - Assigns a unique ID to each worktree for easy management
 - Supports branch names with `/` (e.g. `fix/my-bug`)
-- Handles monorepo workspaces (npm/yarn/pnpm)
+- Monorepo aware: copies `apps/*/node_modules`, `apps/api/.env`, nested virtualenvs, etc. (npm/yarn/pnpm/Nx/Turbo/Lerna)
 - Optional symlink mode to save disk space
 - Built-in registry to list and remove worktrees by ID
 
-## Supported Project Types
+## What Gets Copied
 
-| Type | Detected By | What Gets Copied |
-|------|------------|------------------|
-| **Node.js** | `package.json` | `node_modules`, workspace `node_modules`, `.next`, `.nuxt`, `.turbo`, `dist`, `build` |
-| **React / Vue / Angular** | `react`/`next`/`vue`/`angular` in `package.json` | Same as Node.js |
-| **Python** | `requirements.txt`, `pyproject.toml`, `Pipfile`, `setup.py` | `venv`/`.venv` (with path fixup), `.python-version` |
-| **Go** | `go.mod` | `vendor`, `.air.toml`, `tmp` (build cache) |
-| **iOS / Xcode** | `Podfile` | `Pods`, `.build`, `.swiftpm`, `Carthage`, `.xcworkspace`, `GoogleService-Info.plist`, `.xcconfig` |
+Every untracked or gitignored path in the repo is checked by name, **at any depth**. Matches are copied to the same relative path in the worktree, so monorepo packages are covered without any config.
 
-All project types also get:
-- Environment files: `.env`, `.env.local`, `.env.development`, `.env.test`, `.env.production`, `.env.staging` (and their `.local` variants)
-- Common config: `.editorconfig`, `.tool-versions`, `.nvmrc`, `.node-version`, `.ruby-version`, `.mise.toml`, `docker-compose.override.yml`
+| Type | What Gets Copied |
+|------|------------------|
+| **Node.js / React** | `node_modules`; `.next`, `.nuxt`, `.turbo`, `dist`, `build` (when next to a `package.json`) |
+| **Python** | Any virtualenv (dir with `bin/activate`, with path fixup), `.python-version` |
+| **Go** | `vendor`, `.air.toml`, `tmp` (when next to `.air.toml`) |
+| **iOS / Xcode** | `Pods`, `.build`, `.swiftpm`, `Carthage`, `*.xcworkspace`, `*.xcconfig`, `GoogleService-Info.plist`, `firebase.json` |
+| **All** | `.env`, `.env.*`, `.editorconfig`, `.tool-versions`, `.nvmrc`, `.node-version`, `.ruby-version`, `.mise.toml`, `.mise.local.toml`, `docker-compose.override.yml`, `.docker-env` |
 
-Multiple project types can be detected simultaneously (e.g. a Node.js + React project).
+Tracked files are never copied (they are already in the checkout). Paths that already exist in the worktree are skipped.
+
+Example monorepo:
+
+```
+apps/api/.env               → copied
+apps/api/node_modules/      → copied
+apps/web/.env.local         → copied
+apps/web/.next/             → copied
+packages/ui/node_modules/   → copied
+services/worker/.venv/      → copied, paths fixed
+```
 
 ## Installation
 
@@ -174,10 +183,11 @@ git-worktree-manager --list [--all]
 ## How It Works
 
 1. **Creates a git worktree** using `git worktree add` for the given branch
-2. **Detects the project type** by looking for marker files (`package.json`, `go.mod`, `Podfile`, etc.)
-3. **Copies runtime dependencies** that are typically gitignored but required to run the project
+2. **Lists untracked and gitignored paths** with `git ls-files --others --ignored --directory` (ignored dirs like `node_modules` are listed once, not walked)
+3. **Copies runtime dependencies** matched by name at any depth (see [What Gets Copied](#what-gets-copied))
 4. **Registers the worktree** in a JSON registry at `~/.config/git-worktree-manager/registry.json` with a unique 6-character ID
 5. For **Python projects**, it fixes the virtualenv paths (`pyvenv.cfg` and `activate` scripts) to point to the new worktree location
+6. For **Husky**, an absolute `core.hooksPath` inside the repo is overridden for the worktree only (`git config --worktree`), so the main repo's hooks are never changed
 
 ### Registry
 
